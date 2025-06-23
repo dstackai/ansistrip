@@ -3,13 +3,31 @@ package ansistrip
 import (
 	"bytes"
 	"io"
-	"log"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/sirupsen/logrus"
 )
+
+// Logger instance for trace logging
+var logger = logrus.New()
+
+func init() {
+	// Set default log level to INFO (traces won't show unless explicitly set to TRACE)
+	logger.SetLevel(logrus.InfoLevel)
+	logger.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp: true,
+	})
+}
+
+// SetLogLevel allows setting the log level for the ansistrip package.
+// To enable trace logging, call: ansistrip.SetLogLevel(logrus.TraceLevel)
+func SetLogLevel(level logrus.Level) {
+	logger.SetLevel(level)
+}
 
 // ANSI parser states
 const (
@@ -56,18 +74,18 @@ func NewWriter(downstream io.Writer, inactivityTimeout, forceFlushTimeout time.D
 // writerLoop's only job is to write to the downstream writer.
 func (w *Writer) writerLoop() {
 	defer w.wg.Done()
-	log.Printf("[WRITER]  | Starting loop")
+	logger.Tracef("[WRITER]  | Starting loop")
 	for p := range w.output {
 		w.downstream.Write(p)
 	}
-	log.Printf("[WRITER]  | Loop finished.")
+	logger.Tracef("[WRITER]  | Loop finished.")
 }
 
 // manager owns and manages all internal state.
 func (w *Writer) manager() {
 	defer w.wg.Done()
 	defer close(w.output)
-	log.Println("[MANAGER] | Starting loop")
+	logger.Trace("[MANAGER] | Starting loop")
 
 	var unprocessedBytes []byte
 	running := true
@@ -111,7 +129,7 @@ func (w *Writer) manager() {
 			var processedCount int
 			unprocessedBytes, processedCount = w.processChunk(unprocessedBytes, 512) // Process up to 512 runes
 			if processedCount == 0 && len(unprocessedBytes) > 0 {
-				log.Println("[MANAGER] | WARN: Made no progress processing buffer. Discarding to prevent infinite loop.")
+				logger.Trace("[MANAGER] | WARN: Made no progress processing buffer. Discarding to prevent infinite loop.")
 				unprocessedBytes = nil // Failsafe
 			}
 		}
@@ -144,20 +162,20 @@ func (w *Writer) manager() {
 		case p, ok := <-w.writeRequests:
 			if !ok {
 				running = false // Signal to start shutting down.
-				log.Println("[MANAGER] | Event: writeRequests channel closed.")
+				logger.Trace("[MANAGER] | Event: writeRequests channel closed.")
 			} else {
-				log.Printf("[MANAGER] | Event: Got %d bytes from writeRequests.", len(p))
+				logger.Tracef("[MANAGER] | Event: Got %d bytes from writeRequests.", len(p))
 				unprocessedBytes = append(unprocessedBytes, p...)
 			}
 		case <-w.caretMoved:
 			resetInactivity()
 		case <-inactivityTimer.C:
-			log.Println("[MANAGER] | Event: Inactivity timer fired.")
+			logger.Trace("[MANAGER] | Event: Inactivity timer fired.")
 			if w.flushInternal(false) {
 				resetForceFlush()
 			}
 		case <-forceFlushC:
-			log.Println("[MANAGER] | Event: Force flush ticker fired.")
+			logger.Trace("[MANAGER] | Event: Force flush ticker fired.")
 			if w.flushInternal(false) {
 				resetForceFlush()
 			}
@@ -166,7 +184,7 @@ func (w *Writer) manager() {
 
 	// The loop has exited, meaning `running` is false and `unprocessedBytes` is empty.
 	// All data has been processed. Perform the final guaranteed flush.
-	log.Println("[MANAGER] | Loop finished. Performing final flush.")
+	logger.Trace("[MANAGER] | Loop finished. Performing final flush.")
 	w.flushInternal(true)
 }
 
@@ -186,19 +204,19 @@ func (w *Writer) Write(p []byte) (n int, err error) {
 
 // Close gracefully shuts down the writer, ensuring all buffered data is flushed.
 func (w *Writer) Close() error {
-	log.Println("[CLOSE]   | Close() called. Closing writeRequests.")
+	logger.Trace("[CLOSE]   | Close() called. Closing writeRequests.")
 	close(w.writeRequests)
 	w.wg.Wait()
-	log.Println("[CLOSE]   | WaitGroup finished. Close complete.")
+	logger.Trace("[CLOSE]   | WaitGroup finished. Close complete.")
 
 	// Final diagnostic requested by user.
 	if w.flushedLines < len(w.buffer) {
-		log.Printf("[CLOSE]   | DIAGNOSTIC: %d lines were left in the buffer and not flushed.", len(w.buffer)-w.flushedLines)
+		logger.Tracef("[CLOSE]   | DIAGNOSTIC: %d lines were left in the buffer and not flushed.", len(w.buffer)-w.flushedLines)
 		for i := w.flushedLines; i < len(w.buffer); i++ {
-			log.Printf("[CLOSE]   |   Unflushed Line %d: %s", i, string(w.buffer[i]))
+			logger.Tracef("[CLOSE]   |   Unflushed Line %d: %s", i, string(w.buffer[i]))
 		}
 	} else {
-		log.Printf("[CLOSE]   | DIAGNOSTIC: All buffer lines were flushed.")
+		logger.Tracef("[CLOSE]   | DIAGNOSTIC: All buffer lines were flushed.")
 	}
 
 	if closer, ok := w.downstream.(io.Closer); ok {
@@ -228,7 +246,7 @@ func (w *Writer) flushInternal(flushAll bool) bool {
 		case w.output <- outputBytes:
 			w.flushedLines = lastLineToFlush
 		default:
-			log.Printf("[FLUSH]   | DROPPED FRAME: output channel is full. Downstream is likely blocked.")
+			logger.Tracef("[FLUSH]   | DROPPED FRAME: output channel is full. Downstream is likely blocked.")
 		}
 		return true
 	}
