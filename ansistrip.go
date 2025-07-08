@@ -41,18 +41,27 @@ const (
 	stateCSI
 )
 
+// line represents a single line in the buffer, tracking both its
+// rune content and its byte size for efficient memory management.
+type line struct {
+	runes    []rune
+	byteSize int
+}
+
 // Writer is a thread-safe, ANSI-aware, buffering io.Writer.
 type Writer struct {
 	downstream        io.Writer
 	inactivityTimeout time.Duration
 	forceFlushTimeout time.Duration
+	maxBufferSize     int
 	writeRequests     chan *[]byte
 	caretMoved        chan struct{}
 	output            chan []byte
 	wg                sync.WaitGroup
 
 	// All state below is owned exclusively by the manager goroutine.
-	buffer            *btree.Map[int, []rune] // Ordered sparse buffer (B-Tree)
+	buffer            *btree.Map[int, *line]
+	currentBufferSize int
 	cursorX           int
 	cursorY           int
 	flushedLinesCount int
@@ -63,15 +72,19 @@ type Writer struct {
 }
 
 // NewWriter creates and starts a new ANSI-aware buffering Writer.
-func NewWriter(downstream io.Writer, inactivityTimeout, forceFlushTimeout time.Duration) *Writer {
+// maxBufferSize sets the maximum size of the internal buffer in bytes.
+// If the buffer exceeds this size, a flush is triggered. It also sets the
+// maximum size of any single write to the downstream writer. A value of 0 or less disables this feature.
+func NewWriter(downstream io.Writer, inactivityTimeout, forceFlushTimeout time.Duration, maxBufferSize int) *Writer {
 	w := &Writer{
 		downstream:        downstream,
 		inactivityTimeout: inactivityTimeout,
 		forceFlushTimeout: forceFlushTimeout,
+		maxBufferSize:     maxBufferSize,
 		writeRequests:     make(chan *[]byte, 256),
 		caretMoved:        make(chan struct{}, 128),
 		output:            make(chan []byte, 256),
-		buffer:            btree.NewMap[int, []rune](32),
+		buffer:            btree.NewMap[int, *line](32),
 	}
 	w.wg.Add(2)
 	go w.manager()
@@ -135,6 +148,14 @@ func (w *Writer) manager() {
 		if len(unprocessedBytes) > 0 {
 			processedCount := w.processBytes(unprocessedBytes)
 			unprocessedBytes = unprocessedBytes[processedCount:]
+
+			// Check if buffer size has been exceeded and trigger a flush.
+			if w.maxBufferSize > 0 && w.currentBufferSize > w.maxBufferSize {
+				logger.Tracef("[MANAGER] | Buffer size %d exceeds max %d, triggering flush.", w.currentBufferSize, w.maxBufferSize)
+				if w.flushInternal(false) {
+					resetForceFlush()
+				}
+			}
 		}
 
 		if !running || len(unprocessedBytes) > 0 {
@@ -217,35 +238,144 @@ func (w *Writer) Close() error {
 
 // flushInternal writes lines from the buffer to the output channel.
 func (w *Writer) flushInternal(flushAll bool) bool {
-	var toWrite bytes.Buffer
-	linesToFlush := make([]int, 0, 16)
+	var anythingFlushed bool
 
-	w.buffer.Scan(func(y int, line []rune) bool {
-		if y < w.cursorY || flushAll {
-			toWrite.WriteString(strings.TrimRight(string(line), " \x00"))
-			toWrite.WriteRune('\n')
-			linesToFlush = append(linesToFlush, y)
-		}
-		if !flushAll && y >= w.cursorY {
-			return false
+	// Define flushCandidate once at the top level of the function scope.
+	type flushCandidate struct {
+		y    int
+		info *line
+	}
+
+	// Phase 1: Collect all lines that are eligible for flushing.
+	var candidates []flushCandidate
+	w.buffer.Scan(func(y int, lineInfo *line) bool {
+		// On final flush, collect everything. Otherwise, only completed lines.
+		if flushAll || y < w.cursorY {
+			candidates = append(candidates, flushCandidate{y: y, info: lineInfo})
 		}
 		return true
 	})
 
-	if toWrite.Len() > 0 {
-		logger.Tracef("[FLUSH]   | Flushing %d lines.", len(linesToFlush))
-		outputBytes := make([]byte, toWrite.Len())
-		copy(outputBytes, toWrite.Bytes())
-		w.output <- outputBytes
+	// Phase 2: Process the candidates with proper batching and chunking.
+	if len(candidates) > 0 {
+		anythingFlushed = true
 
-		for _, y := range linesToFlush {
-			w.buffer.Delete(y)
+		var toWrite bytes.Buffer
+		keysInBatch := make([]int, 0, len(candidates))
+		var batchSize int
+		var runeBuf [utf8.UTFMax]byte
+
+		commitCurrentBatch := func() {
+			if toWrite.Len() == 0 {
+				return
+			}
+
+			logger.Tracef("[FLUSH]   | Committing batch of %d bytes, %d lines.", toWrite.Len(), len(keysInBatch))
+			outputBytes := make([]byte, toWrite.Len())
+			copy(outputBytes, toWrite.Bytes())
+			w.output <- outputBytes
+
+			for _, y := range keysInBatch {
+				w.buffer.Delete(y)
+			}
+			w.currentBufferSize -= batchSize
+			w.flushedLinesCount += len(keysInBatch)
+
+			toWrite.Reset()
+			keysInBatch = keysInBatch[:0]
+			batchSize = 0
 		}
-		w.flushedLinesCount += len(linesToFlush)
-		logger.Tracef("[FLUSH]   | Flush complete. Total flushed lines: %d.", w.flushedLinesCount)
-		return true
+
+		for _, cand := range candidates {
+			lineRunes := cand.info.runes
+			lastChar := len(lineRunes) - 1
+			for lastChar >= 0 && (lineRunes[lastChar] == ' ' || lineRunes[lastChar] == '\x00') {
+				lastChar--
+			}
+
+			// Estimate the size of the line to be written. This is the crucial check for batching.
+			// It must be calculated before we start writing to `toWrite`.
+			lineWriteSize := 0
+			for i := 0; i <= lastChar; i++ {
+				lineWriteSize += utf8.RuneLen(lineRunes[i])
+			}
+			lineWriteSize++ // For the newline
+
+			// If adding this *entire* next line would overflow the current batch, flush the batch first.
+			if w.maxBufferSize > 0 && toWrite.Len() > 0 && toWrite.Len()+lineWriteSize > w.maxBufferSize {
+				commitCurrentBatch()
+			}
+
+			// Now, add the line to the buffer. This loop also handles chunking if the line
+			// itself is larger than maxBufferSize.
+			for i := 0; i <= lastChar; i++ {
+				r := lineRunes[i]
+				runeLen := utf8.RuneLen(r)
+				if w.maxBufferSize > 0 && toWrite.Len() > 0 && toWrite.Len()+runeLen > w.maxBufferSize {
+					// This condition is met if a single line is being chunked.
+					commitCurrentBatch()
+				}
+				n := utf8.EncodeRune(runeBuf[:], r)
+				toWrite.Write(runeBuf[:n])
+			}
+
+			// Add the newline, with a final check for overflow.
+			if w.maxBufferSize > 0 && toWrite.Len() > 0 && toWrite.Len()+1 > w.maxBufferSize {
+				commitCurrentBatch()
+			}
+			toWrite.WriteRune('\n')
+
+			keysInBatch = append(keysInBatch, cand.y)
+			batchSize += cand.info.byteSize
+		}
+		// After the loop, commit any remaining lines in the final batch.
+		commitCurrentBatch()
 	}
-	return false
+
+	// Phase 3: Handle the single-line-overflow edge case (prefix flush).
+	if !flushAll && w.maxBufferSize > 0 && w.currentBufferSize > w.maxBufferSize {
+		if currentLineInfo, ok := w.buffer.Get(w.cursorY); ok && len(currentLineInfo.runes) > 0 {
+			anythingFlushed = true
+			logger.Tracef("[FLUSH]   | Current line is causing buffer overflow. Flushing prefix.")
+
+			var prefixSizeInBytes int
+			var runeCountToFlush int
+			for i, r := range currentLineInfo.runes {
+				runeLen := utf8.RuneLen(r)
+				if prefixSizeInBytes+runeLen > w.maxBufferSize {
+					if i == 0 { // Ensure we flush at least one char, even if it's too big
+						prefixSizeInBytes = runeLen
+						runeCountToFlush = 1
+					}
+					break
+				}
+				prefixSizeInBytes += runeLen
+				runeCountToFlush = i + 1
+			}
+
+			if runeCountToFlush > 0 {
+				prefixRunes := currentLineInfo.runes[:runeCountToFlush]
+
+				// Directly write the prefix without using the complex batching logic.
+				logger.Tracef("[FLUSH]   | Committing prefix of %d bytes.", prefixSizeInBytes)
+				w.output <- []byte(string(prefixRunes)) // A single allocation here is acceptable for this rare edge case.
+
+				// Update state
+				w.currentBufferSize -= prefixSizeInBytes
+				currentLineInfo.runes = currentLineInfo.runes[runeCountToFlush:]
+				currentLineInfo.byteSize -= prefixSizeInBytes
+				w.cursorX -= runeCountToFlush
+				if w.cursorX < 0 {
+					w.cursorX = 0
+				}
+			}
+		}
+	}
+
+	if anythingFlushed {
+		logger.Tracef("[FLUSH]   | Flush complete. Total flushed lines: %d. New buffer size: %d.", w.flushedLinesCount, w.currentBufferSize)
+	}
+	return anythingFlushed
 }
 
 // processBytes processes the given byte slice.
@@ -293,12 +423,31 @@ func (w *Writer) handleNormalRune(r rune) {
 		isCaretMovement = true
 	default:
 		if r >= ' ' {
-			line, _ := w.buffer.Get(w.cursorY)
-			for len(line) <= w.cursorX {
-				line = append(line, ' ')
+			lineInfo, _ := w.buffer.Get(w.cursorY)
+			if lineInfo == nil {
+				lineInfo = &line{runes: make([]rune, 0, 80)}
 			}
-			line[w.cursorX] = r
-			w.buffer.Set(w.cursorY, line)
+
+			oldLineSize := lineInfo.byteSize
+
+			// Ensure line is long enough, filling with spaces
+			for len(lineInfo.runes) <= w.cursorX {
+				lineInfo.runes = append(lineInfo.runes, ' ')
+				lineInfo.byteSize++ // Space is 1 byte in UTF-8
+			}
+
+			// Replace the rune at cursorX
+			oldRune := lineInfo.runes[w.cursorX]
+			lineInfo.runes[w.cursorX] = r
+
+			// Update line size based on the change
+			lineInfo.byteSize -= utf8.RuneLen(oldRune)
+			lineInfo.byteSize += utf8.RuneLen(r)
+
+			w.buffer.Set(w.cursorY, lineInfo)
+
+			// Update total buffer size
+			w.currentBufferSize += (lineInfo.byteSize - oldLineSize)
 			w.cursorX++
 		}
 	}
@@ -435,49 +584,94 @@ func (w *Writer) setCursorPos() {
 
 func (w *Writer) eraseInLine() {
 	mode := w.parseInt(w.params[0], 0)
-	line, _ := w.buffer.Get(w.cursorY)
+	lineInfo, ok := w.buffer.Get(w.cursorY)
+	if !ok {
+		return
+	}
+
+	oldSize := lineInfo.byteSize
 
 	switch mode {
-	case 0:
-		if w.cursorX < len(line) {
-			w.buffer.Set(w.cursorY, line[:w.cursorX])
-		}
-	case 1:
-		if w.cursorX < len(line) {
-			for i := 0; i <= w.cursorX && i < len(line); i++ {
-				line[i] = ' '
+	case 0: // Erase from cursor to end of line
+		if w.cursorX < len(lineInfo.runes) {
+			var removedSize int
+			for _, r := range lineInfo.runes[w.cursorX:] {
+				removedSize += utf8.RuneLen(r)
 			}
-			w.buffer.Set(w.cursorY, line)
-		} else {
-			w.buffer.Set(w.cursorY, make([]rune, 0, 80))
+			lineInfo.runes = lineInfo.runes[:w.cursorX]
+			lineInfo.byteSize -= removedSize
 		}
-	case 2:
-		w.buffer.Set(w.cursorY, make([]rune, 0, 80))
+	case 1: // Erase from start of line to cursor
+		if w.cursorX < len(lineInfo.runes) {
+			sizeDelta := 0
+			// Erase up to and including the cursor position
+			eraseUpTo := w.cursorX
+			if eraseUpTo >= len(lineInfo.runes) {
+				eraseUpTo = len(lineInfo.runes) - 1
+			}
+			for i := 0; i <= eraseUpTo; i++ {
+				sizeDelta -= utf8.RuneLen(lineInfo.runes[i])
+				lineInfo.runes[i] = ' '
+				sizeDelta += 1 // ' ' is 1 byte
+			}
+			lineInfo.byteSize += sizeDelta
+		} else {
+			// Cursor is at or past the end of the line, clear the whole line by replacing with spaces
+			sizeDelta := 0
+			for i := 0; i < len(lineInfo.runes); i++ {
+				sizeDelta -= utf8.RuneLen(lineInfo.runes[i])
+				lineInfo.runes[i] = ' '
+				sizeDelta += 1
+			}
+			lineInfo.byteSize += sizeDelta
+		}
+	case 2: // Erase entire line
+		lineInfo.runes = lineInfo.runes[:0]
+		lineInfo.byteSize = 0
 	}
+
+	w.currentBufferSize += (lineInfo.byteSize - oldSize)
 }
 
 func (w *Writer) eraseInDisplay() {
 	mode := w.parseInt(w.params[0], 0)
 	switch mode {
-	case 0:
+	case 0: // Erase from cursor down
 		w.eraseInLine()
-		w.buffer.Scan(func(y int, _ []rune) bool {
+		var linesToDelete []int
+		var sizeToDelete int
+		w.buffer.Scan(func(y int, lineInfo *line) bool {
 			if y > w.cursorY {
-				w.buffer.Delete(y)
+				linesToDelete = append(linesToDelete, y)
+				sizeToDelete += lineInfo.byteSize
 			}
 			return true
 		})
-	case 1:
-		w.buffer.Scan(func(y int, _ []rune) bool {
+		for _, y := range linesToDelete {
+			w.buffer.Delete(y)
+		}
+		w.currentBufferSize -= sizeToDelete
+
+	case 1: // Erase from cursor up
+		var linesToDelete []int
+		var sizeToDelete int
+		w.buffer.Scan(func(y int, lineInfo *line) bool {
 			if y < w.cursorY {
-				w.buffer.Delete(y)
+				linesToDelete = append(linesToDelete, y)
+				sizeToDelete += lineInfo.byteSize
 				return true
 			}
 			return false
 		})
+		for _, y := range linesToDelete {
+			w.buffer.Delete(y)
+		}
+		w.currentBufferSize -= sizeToDelete
+
 		w.params = []string{"1"}
 		w.eraseInLine()
-	case 2:
+	case 2: // Erase entire display
+		w.currentBufferSize = 0
 		w.buffer.Clear()
 		w.cursorX, w.cursorY = 0, 0
 	}
